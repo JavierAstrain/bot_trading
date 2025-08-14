@@ -1,10 +1,18 @@
 import os
 import tempfile
+from io import BytesIO
+from datetime import datetime
+
 import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
 import google.generativeai as genai
+from google.generativeai import types as genai_types
+
+# PDF export
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 # ====== intentar pandas_ta; si falla, usar fallback propio ======
 HAS_PANDAS_TA = True
@@ -12,7 +20,6 @@ try:
     import pandas_ta as ta  # pip install pandas-ta (paquete con guion)
 except Exception:
     HAS_PANDAS_TA = False
-
 
 # =========================
 # CONFIGURACIÓN INICIAL
@@ -25,17 +32,28 @@ if not API_KEY:
 else:
     genai.configure(api_key=API_KEY)
 
-st.title("🤖📈 Asesor de Trading Experto IA")
-st.caption("Análisis técnico desde imágenes, históricos automáticos (Yahoo Finance), fundamentales, gestión de riesgo y Q&A estilo asesor profesional (CFDs).")
+# Config de generación (menos evasiva, pero decidida)
+GEN_CONFIG = genai_types.GenerationConfig(
+    temperature=0.7,
+    top_p=0.9,
+    candidate_count=1,
+    max_output_tokens=1200,
+)
 
-# --- Estado para Q&A ---
+st.title("🤖📈 Asesor de Trading Experto IA")
+st.info(
+    "El asesor **siempre** entrega una hipótesis operable con niveles, escenarios y probabilidad. "
+    "Si la imagen no trae indicadores/timeframe, se **asumen** y se declaran."
+)
+
+# --- Estado para Q&A y estrategias ---
 if "last_symbol" not in st.session_state: st.session_state.last_symbol = None
 if "last_df" not in st.session_state: st.session_state.last_df = None
 if "last_period" not in st.session_state: st.session_state.last_period = None
 if "last_interval" not in st.session_state: st.session_state.last_interval = None
 if "last_image_analysis" not in st.session_state: st.session_state.last_image_analysis = None
 if "chat" not in st.session_state: st.session_state.chat = []
-
+if "strategies" not in st.session_state: st.session_state.strategies = []  # [{'ts','type','symbol','content_md'}]
 
 # =========================
 # UTILIDADES GENERALES
@@ -54,7 +72,6 @@ def fmt_num(v, ndigits=4):
 @st.cache_data(show_spinner=False)
 def yf_download(symbol: str, period: str, interval: str) -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
-    # Fuerza numéricos
     for c in [col for col in ["Open", "High", "Low", "Close"] if c in df.columns]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
@@ -151,13 +168,13 @@ def fundamentals_and_news(symbol: str):
 
 # ===== LLM helpers =====
 def llm_text(prompt: str) -> str:
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-1.5-flash", generation_config=GEN_CONFIG)
     resp = model.generate_content(prompt)
     return getattr(resp, "text", "").strip()
 
 def llm_image(prompt: str, image_path: str) -> str:
     uploaded = genai.upload_file(image_path)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-1.5-flash", generation_config=GEN_CONFIG)
     resp = model.generate_content([prompt, uploaded])
     return getattr(resp, "text", "").strip()
 
@@ -169,75 +186,158 @@ def df_compact_summary(df: pd.DataFrame, rows: int = 60) -> str:
         cols = [c for c in df.columns if c in ["Open","High","Low","Close"]][:4] or df.columns[:6]
     return df.tail(rows)[cols].round(4).to_string()
 
-def build_trading_prompt_from_df(symbol: str, df: pd.DataFrame, period: str, interval: str) -> str:
-    cols = [c for c in ["Open","High","Low","Close","EMA20","EMA50","EMA200","RSI14","ATR14","MACD","MACD_signal","MACD_hist"] if c in df.columns]
-    tail_txt = df.tail(80)[cols].round(4).to_string()
-    last = df.iloc[-1]
-    last_close = float(last["Close"])
-    last_rsi = float(last["RSI14"]) if "RSI14" in df.columns and pd.notnull(last["RSI14"]) else "NA"
-    last_atr = float(last["ATR14"]) if "ATR14" in df.columns and pd.notnull(last["ATR14"]) else "NA"
+# ===== Señal cuantitativa objetiva =====
+def rule_based_signal(df: pd.DataFrame):
+    """Cálculo objetivo de sesgo y niveles a partir de EMAs, RSI, MACD, ATR."""
+    if df is None or df.empty or len(df) < 50:
+        return {"valid": False, "reason": "Datos insuficientes"}
 
+    row = df.iloc[-1]
+    close = float(row["Close"])
+    ema20 = float(row["EMA20"]) if pd.notnull(row.get("EMA20")) else None
+    ema50 = float(row["EMA50"]) if pd.notnull(row.get("EMA50")) else None
+    ema200 = float(row["EMA200"]) if pd.notnull(row.get("EMA200")) else None
+    rsi14 = float(row["RSI14"]) if pd.notnull(row.get("RSI14")) else None
+    macd_hist = float(row["MACD_hist"]) if pd.notnull(row.get("MACD_hist")) else None
+    atr14 = float(row.get("ATR14")) if "ATR14" in df.columns and pd.notnull(row.get("ATR14")) else None
+
+    score = 0
+    notes = []
+
+    # Tendencia por EMAs
+    if ema20 and ema50 and ema200:
+        if ema20 > ema50 > ema200:
+            score += 2; notes.append("EMAs alineadas alcistas (20>50>200).")
+        elif ema20 < ema50 < ema200:
+            score -= 2; notes.append("EMAs alineadas bajistas (20<50<200).")
+        else:
+            notes.append("EMAs mixtas (lateral/transición).")
+
+    # RSI
+    if rsi14 is not None:
+        if rsi14 > 55: score += 1; notes.append(f"RSI(14) fuerte ({rsi14:.1f}).")
+        elif rsi14 < 45: score -= 1; notes.append(f"RSI(14) débil ({rsi14:.1f}).")
+        else: notes.append(f"RSI(14) neutro ({rsi14:.1f}).")
+
+    # MACD histograma
+    if macd_hist is not None:
+        if macd_hist > 0: score += 1; notes.append("MACD hist > 0 (impulso alcista).")
+        elif macd_hist < 0: score -= 1; notes.append("MACD hist < 0 (impulso bajista).")
+
+    # Sesgo
+    if score >= 2: bias = "ALCISTA"
+    elif score <= -2: bias = "BAJISTA"
+    else: bias = "LATERAL/NEUTRO"
+
+    # Niveles por ATR (si hay)
+    rr = 2.0  # objetivo por defecto 1:2
+    if atr14 and atr14 > 0:
+        if bias == "ALCISTA":
+            entry = close
+            sl = close - 1.5 * atr14
+            tp = entry + rr * (entry - sl)
+        elif bias == "BAJISTA":
+            entry = close
+            sl = close + 1.5 * atr14
+            tp = entry - rr * (sl - entry)
+        else:
+            entry = close
+            sl = close - 1.0 * atr14
+            tp = entry + 1.0 * atr14
+    else:
+        entry, sl, tp = close, None, None
+
+    # Puntaje de confianza (1–5)
+    conf = 3
+    if abs(score) >= 3: conf = 4
+    if abs(score) >= 4: conf = 5
+    if bias == "LATERAL/NEUTRO": conf = 2
+
+    return {
+        "valid": True,
+        "bias": bias,
+        "score": score,
+        "confidence": conf,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "atr": atr14,
+        "notes": notes
+    }
+
+# ===== Fusión señal + IA =====
+def fused_advice_from_signal(symbol: str, interval: str, horizon_hint: str, signal: dict, df: pd.DataFrame):
+    sample = df_compact_summary(df, rows=60)
     prompt = f"""
-Actúa como asesor de trading experto para CFDs.
-Instrumento: {symbol} | Periodo: {period} | Intervalo: {interval}
-Último cierre: {last_close}
-RSI(14): {last_rsi} | ATR(14): {last_atr}
+Eres ASESOR DE TRADING EXPERTO en CFDs. Tienes una señal cuantitativa previa y debes:
+- Explicarla en lenguaje claro,
+- Afinar niveles (si corresponde),
+- Entregar 3 escenarios probables con %,
+- Dar plan operativo inmediato (entrada/SL/TP/R:R),
+- Confirmaciones e invalidaciones,
+- Gestión de riesgo y recomendación de apalancamiento.
 
-Datos recientes:
-{tail_txt}
+Señal base objetiva:
+- Sesgo: {signal.get('bias')}
+- Score: {signal.get('score')}
+- Confianza preliminar (1–5): {signal.get('confidence')}
+- Entrada: {fmt_num(signal.get('entry'))}
+- SL: {fmt_num(signal.get('sl'))}
+- TP: {fmt_num(signal.get('tp'))}
+- ATR(14): {fmt_num(signal.get('atr'))}
+- Notas: {", ".join(signal.get('notes', []))}
 
-Entrega:
-1) Lectura técnica (tendencia, cruces EMA, RSI, MACD, soportes/resistencias).
-2) Estrategia principal (long o short) y alternativa si aplica.
-3) Niveles concretos: entrada(s), SL (puedes referenciar ATR), TP(s) y ratio riesgo:beneficio.
-4) Escenarios probables e invalidaciones.
-5) Gestión del riesgo y temporalidad recomendada (scalp/intradía/swing).
-Sé específico y accionable. No inventes precios.
-"""
-    return prompt
+Contexto de datos recientes ({symbol}, {interval}):
+{sample}
 
-def qa_answer(user_q: str) -> str:
-    symbol = st.session_state.last_symbol
-    df = st.session_state.last_df
-    period = st.session_state.last_period
-    interval = st.session_state.last_interval
-    img_ctx = st.session_state.last_image_analysis
+Instrucciones:
+1) Reafirma o ajusta el sesgo y explica por qué.
+2) Propón **niveles concretos** (puedes ajustar entrada/SL/TP de la señal base si mejora el R:R). Incluye ratio R:R.
+3) Da **3 escenarios con probabilidades** (base/alcista/bajista) para el siguiente tramo temporal coherente con {interval}.
+4) Define **confirmaciones** e **invalidaciones** claras.
+5) Recomienda **gestión de riesgo** (apalancamiento sugerido, % del balance a arriesgar, cuándo NO operar).
+6) Puntúa **confianza final 1–5**.
 
-    ctx_parts = []
-    if symbol and df is not None and not df.empty:
-        ctx_parts.append(f"Contexto del último símbolo: {symbol} (periodo={period}, intervalo={interval}).")
-        ctx_parts.append("Muestra de datos recientes con indicadores:")
-        ctx_parts.append(df_compact_summary(df))
-        last = df.iloc[-1]
-        quick = []
-        for k in ["Close","EMA20","EMA50","EMA200","RSI14","ATR14"]:
-            if k in df.columns and pd.notnull(last.get(k, None)):
-                quick.append(f"{k}={fmt_num(last.get(k))}")
-        if quick:
-            ctx_parts.append("Lectura técnica rápida: " + ", ".join(quick) + ".")
-    if img_ctx:
-        ctx_parts.append("Resumen del último análisis por imagen:")
-        ctx_parts.append(img_ctx)
-
-    ctx = "\n".join(ctx_parts) if ctx_parts else "No hay contexto previo disponible."
-
-    prompt = f"""
-Eres un **asesor de trading experto en CFDs**.
-Tienes el contexto siguiente (datos históricos y/o análisis visual):
-
-{ctx}
-
-Pregunta del usuario: {user_q}
-
-Responde de forma profesional y accionable:
-- Da niveles de entrada, SL, TP y ratio R:R si corresponde.
-- Indica sesgo (alcista/bajista/lateral) y temporalidad sugerida.
-- Señala confirmaciones/invalidaciones y riesgos.
-- Si faltan datos, pide explícitamente lo que necesitas (símbolo, timeframe, etc.).
-No inventes precios.
+Formato: Markdown. No digas que “no puedes”. Si falta algo, asúmelo explícitamente y sigue.
 """
     return llm_text(prompt)
 
+# ===== Registro y exportación =====
+def store_strategy(kind: str, symbol: str, content_md: str):
+    item = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "type": kind,  # "symbol" | "image"
+        "symbol": symbol,
+        "content_md": content_md
+    }
+    st.session_state.strategies.append(item)
+
+def build_md_report(header: str, content_md: str):
+    return f"# {header}\n\n{content_md}\n\n---\n_Reporte generado por Asesor de Trading IA — {datetime.now().strftime('%Y-%m-%d %H:%M')}_"
+
+def md_to_pdf_bytes(title: str, md_text: str) -> bytes:
+    # Render simple (texto plano). Para estilos, usar xhtml2pdf/WeasyPrint en el futuro.
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+    x, y = 40, height - 40
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x, y, title)
+    y -= 20
+    c.setFont("Helvetica", 10)
+
+    for line in md_text.splitlines():
+        for chunk in [line[i:i+95] for i in range(0, len(line), 95)]:
+            y -= 12
+            if y < 40:
+                c.showPage()
+                y = height - 40
+                c.setFont("Helvetica", 10)
+            c.drawString(x, y, chunk)
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.read()
 
 # =========================
 # INTERFAZ
@@ -247,12 +347,17 @@ mode = st.sidebar.radio("Selecciona modo", ["📷 Analizar imagen de gráfico", 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Ejemplos:** `BTC-USD`, `AAPL`, `TSLA`, `GOLD`, `EURUSD=X`, `^GSPC`")
 
-
 # =========================
 # MODO: IMAGEN
 # =========================
 if mode == "📷 Analizar imagen de gráfico":
-    file = st.file_uploader("Sube una imagen de tu gráfico (TradingView, MetaTrader, broker, etc.)", type=["png", "jpg", "jpeg", "webp"])
+    # Controles para reforzar contexto cuando la imagen no trae datos
+    colx1, colx2, colx3 = st.columns(3)
+    assumed_tf = colx1.selectbox("Temporalidad asumida", ["1m","5m","15m","1h","4h","1d","1w"], index=3)
+    risk_profile = colx2.selectbox("Perfil de riesgo", ["Conservador","Moderado","Agresivo"], index=1)
+    horizon = colx3.selectbox("Horizonte de estimación", ["Próximas 4h","Próximas 24h","Próximas 72h","Próximas 2 semanas"], index=1)
+
+    file = st.file_uploader("Sube una imagen (TradingView, MetaTrader, broker, etc.)", type=["png", "jpg", "jpeg", "webp"])
     if file is not None:
         st.image(file, caption="Gráfico subido", use_container_width=True)
 
@@ -261,23 +366,37 @@ if mode == "📷 Analizar imagen de gráfico":
             image_path = tmp.name
 
         with st.spinner("Analizando gráfico con IA..."):
-            prompt_img = (
-                "Eres un asesor de trading experto. Analiza el gráfico subido y responde conciso:\n"
-                "1) Tendencia principal (alcista/bajista/lateral) y por qué.\n"
-                "2) Patrones visibles (canales, triángulos, HCH, doble techo/suelo) y zonas S/R.\n"
-                "3) Lectura de indicadores visibles (RSI, MACD, EMAs/Bollinger) si aparecen.\n"
-                "4) Estrategia CFD (long/short): condiciones de entrada, SL, TP, ratio R:R.\n"
-                "5) Gestión del riesgo y temporalidad recomendada.\n"
-                "Si faltan datos, pide confirmaciones específicas."
-            )
+            prompt_img = f"""
+Eres un ASESOR DE TRADING EXPERTO en CFDs. Analiza el gráfico y ENTREGA SIEMPRE un plan operable.
+Si faltan datos, **asume** razonablemente y **decláralo**. No digas que es imposible.
+
+Contexto forzado por el usuario:
+- Temporalidad asumida: {assumed_tf}
+- Perfil de riesgo: {risk_profile}
+- Horizonte de estimación: {horizon}
+
+Instrucciones:
+1) **Diagnóstico**: sesgo (alcista/bajista/lateral) y por qué (estructura de precio, velas, S/R visibles).
+2) **Niveles concretos**: entrada(s), SL, TP. Incluye ratio R:R.
+3) **Estrategia**: LONG/SHORT (o dos alternativas) y temporalidad recomendada.
+4) **Gestión del riesgo**: apalancamiento según "{risk_profile}" y % de balance.
+5) **Pronóstico**: 3 escenarios (base/alcista/bajista) para "{horizon}" con **probabilidad (%)**.
+6) **Confirmaciones** e **invalidaciones**.
+7) **Confianza** (1–5) y breve explicación.
+
+Formato: Markdown claro. **Nunca declares que no puedes**; si asumes algo, dilo y sigue.
+"""
             try:
                 analysis = llm_image(prompt_img, image_path)
                 st.subheader("📈 Análisis Técnico del Gráfico (IA)")
                 st.write(analysis or "No se obtuvo texto del modelo.")
                 st.session_state.last_image_analysis = analysis
+
+                # Registrar para exportación
+                header = "Análisis Técnico del Gráfico (IA)"
+                store_strategy(kind="image", symbol=st.session_state.last_symbol or "(imagen)", content_md=analysis or "")
             except Exception as e:
                 st.error(f"Error analizando imagen: {e}")
-
 
 # =========================
 # MODO: SÍMBOLO
@@ -374,16 +493,19 @@ if mode == "📊 Analizar activo por símbolo (histórico)":
             else:
                 st.info("ATR no disponible para esta combinación de periodo/intervalo.")
 
-            # Recomendación IA
-            with st.spinner("Generando recomendación del asesor..."):
+            # Señal cuantitativa + IA
+            with st.spinner("Calculando señal objetiva..."):
+                sig = rule_based_signal(df)
+
+            with st.spinner("Generando recomendación del asesor…"):
                 try:
-                    prompt = build_trading_prompt_from_df(symbol, df, period, interval)
-                    advice = llm_text(prompt)
-                    st.subheader("🧠 Recomendación del Asesor (IA)")
-                    st.write(advice or "No se obtuvo texto del modelo.")
+                    advice_md = fused_advice_from_signal(symbol, interval, horizon_hint="siguiente tramo", signal=sig, df=df)
+                    st.subheader("🧠 Recomendación del Asesor (Señal + IA)")
+                    st.markdown(advice_md or "No se obtuvo texto del modelo.")
+                    # Registrar para exportación
+                    store_strategy(kind="symbol", symbol=symbol, content_md=advice_md or "")
                 except Exception as e:
                     st.error(f"Ocurrió un error al generar la recomendación: {e}")
-
 
 # =========================
 # CHAT: PREGUNTAS ESPECÍFICAS
@@ -401,6 +523,50 @@ for turn in st.session_state.chat:
     with st.chat_message(turn["role"]):
         st.markdown(turn["content"])
 
+def df_compact_for_prompt(df: pd.DataFrame) -> str:
+    return df_compact_summary(df, rows=60)
+
+def qa_answer(user_q: str) -> str:
+    symbol = st.session_state.last_symbol
+    df = st.session_state.last_df
+    period = st.session_state.last_period
+    interval = st.session_state.last_interval
+    img_ctx = st.session_state.last_image_analysis
+
+    ctx_parts = []
+    if symbol and df is not None and not df.empty:
+        ctx_parts.append(f"Contexto del último símbolo: {symbol} (periodo={period}, intervalo={interval}).")
+        ctx_parts.append("Muestra de datos e indicadores:")
+        ctx_parts.append(df_compact_for_prompt(df))
+        last = df.iloc[-1]
+        quick = []
+        for k in ["Close","EMA20","EMA50","EMA200","RSI14","ATR14"]:
+            if k in df.columns and pd.notnull(last.get(k, None)):
+                quick.append(f"{k}={fmt_num(last.get(k))}")
+        if quick:
+            ctx_parts.append("Lectura rápida: " + ", ".join(quick) + ".")
+    if img_ctx:
+        ctx_parts.append("Resumen del último análisis por imagen:")
+        ctx_parts.append(img_ctx)
+
+    ctx = "\n".join(ctx_parts) if ctx_parts else "No hay contexto previo disponible."
+
+    prompt = f"""
+Eres un **asesor de trading experto en CFDs**.
+Contexto disponible:
+{ctx}
+
+Pregunta del usuario: {user_q}
+
+Responde como profesional:
+- Niveles de entrada, SL, TP, ratio R:R si corresponde.
+- Sesgo y temporalidad sugerida.
+- Confirmaciones e invalidaciones y riesgos.
+- Si falta algo, pide explícitamente el dato, pero **propón** una hipótesis operable igual.
+No inventes precios ilógicos.
+"""
+    return llm_text(prompt)
+
 user_q = st.chat_input("Escribe tu pregunta específica (ej: '¿Qué harías con el último análisis de BTC-USD?')")
 if user_q:
     st.session_state.chat.append({"role": "user", "content": user_q})
@@ -417,6 +583,41 @@ if user_q:
     st.session_state.chat.append({"role": "assistant", "content": ans})
 
 # =========================
+# EXPORTAR ESTRATEGIAS
+# =========================
+st.markdown("---")
+st.header("📦 Exportar estrategias")
+
+if not st.session_state.strategies:
+    st.info("Aún no hay estrategias generadas en esta sesión.")
+else:
+    options = [f"[{i+1}] {s['ts']} — {s['type']} — {s['symbol']}" for i, s in enumerate(st.session_state.strategies)]
+    idx = st.selectbox("Selecciona una estrategia", list(range(len(options))), format_func=lambda i: options[i])
+
+    sel = st.session_state.strategies[idx]
+    header = f"Estrategia {sel['symbol']} — {sel['type']} — {sel['ts']}"
+    md_report = build_md_report(header, sel['content_md'])
+
+    colE1, colE2 = st.columns(2)
+    with colE1:
+        st.download_button(
+            "⬇️ Descargar Markdown",
+            data=md_report.encode("utf-8"),
+            file_name=f"estrategia_{sel['symbol']}_{sel['ts'].replace(':','-')}.md",
+            mime="text/markdown",
+            use_container_width=True
+        )
+    with colE2:
+        pdf_bytes = md_to_pdf_bytes(header, sel["content_md"])
+        st.download_button(
+            "⬇️ Descargar PDF",
+            data=pdf_bytes,
+            file_name=f"estrategia_{sel['symbol']}_{sel['ts'].replace(':','-')}.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+
+# =========================
 # FOOTER
 # =========================
 st.markdown("---")
@@ -424,4 +625,3 @@ st.caption(
     "Este asistente entrega opiniones educativas basadas en datos e IA. No constituye asesoría financiera. "
     "Opera con gestión de riesgo adecuada."
 )
-
