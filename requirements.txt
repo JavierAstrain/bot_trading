@@ -3,4 +3,4 @@ google-generativeai>=0.6.0
 pandas
 yfinance
 plotly
-pandas_ta
+pandas-ta
