@@ -9,14 +9,19 @@ import plotly.graph_objects as go
 
 # IA
 import google.generativeai as genai
-import pandas_ta as ta
+
+# ====== intentar pandas_ta; si no, usar fallback propio ======
+HAS_PANDAS_TA = True
+try:
+    import pandas_ta as ta  # pip install pandas-ta
+except Exception:
+    HAS_PANDAS_TA = False
 
 
 # =========================
 # CONFIGURACIÓN INICIAL
 # =========================
 st.set_page_config(page_title="Asesor de Trading Experto IA", layout="wide")
-
 API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
 if not API_KEY:
@@ -31,6 +36,10 @@ st.caption("Análisis técnico desde imágenes, históricos automáticos (Yahoo 
 # =========================
 # UTILIDADES
 # =========================
+@st.cache_data(show_spinner=False)
+def yf_download(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    return yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+
 def plot_candles(df: pd.DataFrame, title: str):
     fig = go.Figure(data=[
         go.Candlestick(
@@ -42,7 +51,6 @@ def plot_candles(df: pd.DataFrame, title: str):
             name="OHLC"
         )
     ])
-    # EMAs si existen
     for col in ["EMA20", "EMA50", "EMA200"]:
         if col in df.columns:
             fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col))
@@ -50,41 +58,64 @@ def plot_candles(df: pd.DataFrame, title: str):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # EMAs comunes
-    df["EMA20"] = ta.ema(df["Close"], length=20)
-    df["EMA50"] = ta.ema(df["Close"], length=50)
-    df["EMA200"] = ta.ema(df["Close"], length=200)
-    # RSI
-    df["RSI14"] = ta.rsi(df["Close"], length=14)
-    # MACD
-    macd = ta.macd(df["Close"], fast=12, slow=26, signal=9)
-    if macd is not None and not macd.empty:
-        df["MACD"] = macd["MACD_12_26_9"]
-        df["MACD_signal"] = macd["MACDs_12_26_9"]
-        df["MACD_hist"] = macd["MACDh_12_26_9"]
-    return df
+# ---- Indicadores de fallback (si no hay pandas_ta) ----
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/length, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / roll_down
+    return 100 - (100 / (1 + rs))
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if HAS_PANDAS_TA:
+        df["EMA20"] = ta.ema(df["Close"], length=20)
+        df["EMA50"] = ta.ema(df["Close"], length=50)
+        df["EMA200"] = ta.ema(df["Close"], length=200)
+        df["RSI14"] = ta.rsi(df["Close"], length=14)
+        macd_df = ta.macd(df["Close"], fast=12, slow=26, signal=9)
+        if macd_df is not None and not macd_df.empty:
+            df["MACD"] = macd_df["MACD_12_26_9"]
+            df["MACD_signal"] = macd_df["MACDs_12_26_9"]
+            df["MACD_hist"] = macd_df["MACDh_12_26_9"]
+    else:
+        df["EMA20"] = ema(df["Close"], 20)
+        df["EMA50"] = ema(df["Close"], 50)
+        df["EMA200"] = ema(df["Close"], 200)
+        df["RSI14"] = rsi(df["Close"], 14)
+        macd_line, signal_line, hist = macd(df["Close"])
+        df["MACD"] = macd_line
+        df["MACD_signal"] = signal_line
+        df["MACD_hist"] = hist
+    return df
 
 def llm_text(prompt: str) -> str:
     model = genai.GenerativeModel("gemini-1.5-flash")
     resp = model.generate_content(prompt)
     return getattr(resp, "text", "").strip()
 
-
 def llm_image(prompt: str, image_path: str) -> str:
-    """Sube imagen a Gemini y genera análisis."""
-    # Subir archivo a Gemini (la lib necesita un path/bytes, no el objeto de Streamlit)
     uploaded = genai.upload_file(image_path)
     model = genai.GenerativeModel("gemini-1.5-flash")
     resp = model.generate_content([prompt, uploaded])
     return getattr(resp, "text", "").strip()
 
-
 def build_trading_prompt_from_df(symbol: str, df: pd.DataFrame, period: str, interval: str) -> str:
-    tail_txt = df.tail(60)[["Open","High","Low","Close","EMA20","EMA50","EMA200","RSI14"]].round(4).to_string()
+    subset_cols = [c for c in ["Open","High","Low","Close","EMA20","EMA50","EMA200","RSI14"] if c in df.columns]
+    tail_txt = df.tail(60)[subset_cols].round(4).to_string()
     last_close = float(df["Close"].iloc[-1])
-    last_rsi = float(df["RSI14"].iloc[-1]) if pd.notnull(df["RSI14"].iloc[-1]) else "NA"
+    last_rsi = df["RSI14"].iloc[-1] if "RSI14" in df.columns else None
+    last_rsi = float(last_rsi) if pd.notnull(last_rsi) else "NA"
 
     prompt = f"""
 Actúa como un asesor de trading experto para CFDs.
@@ -97,14 +128,11 @@ Datos recientes (últimas ~60 velas con EMAs y RSI):
 {tail_txt}
 
 Objetivo:
-1) Diagnóstico técnico (tendencia: alcista/bajista/lateral) y contexto (cruces EMA, RSI, MACD si aplica).
-2) Zonas/ niveles relevantes (S/R) y confluencias.
-3) Estrategia sugerida (long/short), con:
-   - Entrada sugerida (o condiciones de confirmación)
-   - Stop Loss y Take Profit (con ratio R:R)
-   - Tipo de operativa por temporalidad (scalp/intradía/swing)
-4) Escenarios futuros probables y gestión del riesgo (apalancamiento razonable).
-5) Si no hay setup A+, recomienda esperar y qué confirmaciones mirar.
+1) Diagnóstico técnico (tendencia y contexto: cruces EMA, RSI, MACD).
+2) Niveles relevantes (S/R) y confluencias.
+3) Estrategia sugerida (long/short) con: entrada, Stop Loss, Take Profit y ratio R:R.
+4) Escenarios probables y gestión del riesgo (apalancamiento razonable).
+5) Si no hay setup A+, sugiere esperar y qué confirmaciones mirar.
 
 No inventes precios inexistentes. Usa lenguaje claro y profesional.
 """
@@ -116,9 +144,8 @@ No inventes precios inexistentes. Usa lenguaje claro y profesional.
 # =========================
 st.sidebar.header("Opciones")
 mode = st.sidebar.radio("Selecciona modo", ["📷 Analizar imagen de gráfico", "📊 Analizar activo por símbolo (histórico)"])
-
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Sugerencias de símbolo:** `BTC-USD`, `AAPL`, `TSLA`, `GOLD`, `EURUSD=X`, `^GSPC` (S&P500)")
+st.sidebar.markdown("**Ejemplos:** `BTC-USD`, `AAPL`, `TSLA`, `GOLD`, `EURUSD=X`, `^GSPC`")
 
 
 # =========================
@@ -129,7 +156,6 @@ if mode == "📷 Analizar imagen de gráfico":
     if file is not None:
         st.image(file, caption="Gráfico subido", use_container_width=True)
 
-        # Guardar a archivo temporal (necesario para google-generativeai)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
             tmp.write(file.getbuffer())
             image_path = tmp.name
@@ -137,17 +163,17 @@ if mode == "📷 Analizar imagen de gráfico":
         with st.spinner("Analizando gráfico con IA..."):
             prompt_img = (
                 "Eres un asesor de trading experto. Analiza el gráfico subido y responde conciso:\n"
-                "1) Tendencia principal (alcista/bajista/lateral) y por qué.\n"
-                "2) Patrones técnicos visibles (canales, triángulos, HCH, doble techo/suelo) y zonas S/R.\n"
+                "1) Tendencia (alcista/bajista/lateral) y justificación.\n"
+                "2) Patrones (canales, triángulos, HCH, doble techo/suelo) y zonas S/R.\n"
                 "3) Lectura de indicadores visibles (RSI, MACD, EMAs/Bollinger) si aparecen.\n"
-                "4) Estrategia en CFDs (long/short): entrada sugerida o condiciones, SL, TP, ratio R:R.\n"
-                "5) Gestión del riesgo y temporalidad recomendada.\n"
-                "Evita generalidades, entrega niveles aproximados si son legibles. Si faltan datos, pide confirmaciones."
+                "4) Estrategia CFD (long/short): condiciones de entrada, SL, TP, ratio R:R.\n"
+                "5) Gestión de riesgo y temporalidad más apropiada.\n"
+                "Si faltan datos, pide confirmaciones específicas."
             )
             try:
                 analysis = llm_image(prompt_img, image_path)
                 st.subheader("📈 Análisis Técnico del Gráfico (IA)")
-                st.write(analysis if analysis else "No se obtuvo texto del modelo.")
+                st.write(analysis or "No se obtuvo texto del modelo.")
             except Exception as e:
                 st.error(f"Error analizando imagen: {e}")
 
@@ -167,7 +193,7 @@ if mode == "📊 Analizar activo por símbolo (histórico)":
     if st.button("🔎 Analizar activo"):
         with st.spinner("Descargando histórico..."):
             try:
-                df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+                df = yf_download(symbol, period, interval)
             except Exception as e:
                 df = pd.DataFrame()
                 st.error(f"Error al descargar datos: {e}")
@@ -180,29 +206,28 @@ if mode == "📊 Analizar activo por símbolo (histórico)":
             st.subheader(f"📊 Histórico de {symbol}")
             plot_candles(df, f"{symbol} — {period} @ {interval}")
 
-            # Panel técnico rápido
             last = df.iloc[-1]
             st.markdown("### 🔎 Lectura técnica rápida")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Cierre", f"{last['Close']:.4f}")
-            c2.metric("RSI(14)", f"{last['RSI14']:.2f}" if pd.notnull(last['RSI14']) else "NA")
-            c3.metric("EMA20 vs EMA50", "▲" if last["EMA20"] > last["EMA50"] else "▼")
-            c4.metric("EMA50 vs EMA200", "▲" if last["EMA50"] > last["EMA200"] else "▼")
+            rsi_val = last['RSI14'] if 'RSI14' in df.columns and pd.notnull(last['RSI14']) else None
+            c2.metric("RSI(14)", f"{rsi_val:.2f}" if rsi_val is not None else "NA")
+            c3.metric("EMA20 vs EMA50", "▲" if last.get("EMA20", 0) > last.get("EMA50", 0) else "▼")
+            c4.metric("EMA50 vs EMA200", "▲" if last.get("EMA50", 0) > last.get("EMA200", 0) else "▼")
 
-            # Recomendación con IA
             with st.spinner("Generando recomendación del asesor..."):
                 try:
                     prompt = build_trading_prompt_from_df(symbol, df, period, interval)
                     advice = llm_text(prompt)
                     st.subheader("🧠 Recomendación del Asesor (IA)")
-                    st.write(advice if advice else "No se obtuvo texto del modelo.")
+                    st.write(advice or "No se obtuvo texto del modelo.")
                 except Exception as e:
                     st.error(f"Ocurrió un error al generar la recomendación: {e}")
 
-            # (Opcional) Noticias básicas con yfinance (si el activo las ofrece)
+            # Noticias referenciales (si yfinance las provee)
             try:
                 tk = yf.Ticker(symbol)
-                news = tk.news if hasattr(tk, "news") else []
+                news = getattr(tk, "news", [])
                 if news:
                     st.markdown("### 📰 Últimos titulares (referenciales)")
                     for n in news[:5]:
